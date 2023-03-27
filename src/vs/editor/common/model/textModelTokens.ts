@@ -10,12 +10,14 @@ import { Disposable, MutableDisposable } from 'vs/base/common/lifecycle';
 import { setTimeout0 } from 'vs/base/common/platform';
 import { StopWatch } from 'vs/base/common/stopwatch';
 import { countEOL } from 'vs/editor/common/core/eolCounter';
+import { LineRange } from 'vs/editor/common/core/lineRange';
 import { Position } from 'vs/editor/common/core/position';
 import { IRange } from 'vs/editor/common/core/range';
 import { StandardTokenType } from 'vs/editor/common/encodedTokenAttributes';
 import { EncodedTokenizationResult, IBackgroundTokenizationStore, IBackgroundTokenizer, ILanguageIdCodec, IState, ITokenizationSupport, TokenizationRegistry } from 'vs/editor/common/languages';
 import { nullTokenizeEncoded } from 'vs/editor/common/languages/nullTokenize';
 import { ITextModel } from 'vs/editor/common/model';
+import { FixedArray } from 'vs/editor/common/model/fixedArray';
 import { TextModel } from 'vs/editor/common/model/textModel';
 import { TokenizationTextModelPart } from 'vs/editor/common/model/tokenizationTextModelPart';
 import { IModelContentChangedEvent, IModelLanguageChangedEvent } from 'vs/editor/common/textModelEvents';
@@ -26,49 +28,62 @@ const enum Constants {
 	CHEAP_TOKENIZATION_LENGTH_LIMIT = 2048
 }
 
-/**
- * An array that avoids being sparse by always
- * filling up unused indices with a default value.
- */
-export class ContiguousGrowingArray<T> {
+class RangePriorityQueue {
+	get min(): number | null;
+	removeMin(): number | null;
 
-	private _store: T[] = [];
 
-	constructor(
-		private readonly _default: T
-	) { }
+	addRange(startValue: number, length: number): void;
+	resizeRange(startValue: number, length: number, newLength: number): void;
+}
 
-	public get(index: number): T {
-		if (index < this._store.length) {
-			return this._store[index];
-		}
-		return this._default;
+export class TokenizationStateStore2 {
+	private readonly _lineEndStates = new FixedArray<IState | null>(null);
+	private readonly _invalidEndStatesLineNumbers = new RangePriorityQueue();
+
+	constructor(private lineCount: number) {
+		this._invalidEndStatesLineNumbers.addRange(1, lineCount);
 	}
 
-	public set(index: number, value: T): void {
-		while (index >= this._store.length) {
-			this._store[this._store.length] = this._default;
-		}
-		this._store[index] = value;
+	public getEndState(lineNumber: number): IState | null {
+		return this._lineEndStates.get(lineNumber);
 	}
 
-	// TODO have `replace` instead of `delete` and `insert`
-	public delete(deleteIndex: number, deleteCount: number): void {
-		if (deleteCount === 0 || deleteIndex >= this._store.length) {
-			return;
+	public setEndState(lineNumber: number, state: IState): boolean {
+		while (true) {
+			const min = this._invalidEndStatesLineNumbers.min;
+			if (min !== null && min < lineNumber) {
+				this._invalidEndStatesLineNumbers.removeMin();
+			} else {
+				break;
+			}
 		}
-		this._store.splice(deleteIndex, deleteCount);
+
+		const oldState = this._lineEndStates.get(lineNumber);
+		if (oldState && oldState.equals(state)) {
+			return false;
+		}
+
+		this._lineEndStates.set(lineNumber, state);
+		return true;
 	}
 
-	public insert(insertIndex: number, insertCount: number): void {
-		if (insertCount === 0 || insertIndex >= this._store.length) {
-			return;
-		}
-		const arr: T[] = [];
-		for (let i = 0; i < insertCount; i++) {
-			arr[i] = this._default;
-		}
-		this._store = arrays.arrayInsert(this._store, insertIndex, arr);
+	public invalidateEndStateRange(lineRange: LineRange): void {
+		this._invalidEndStatesLineNumbers.addRange(lineRange.startLineNumber, lineRange.length);
+	}
+
+	public getFirstInvalidEndStateLineNumber(): number | null {
+		return this._invalidEndStatesLineNumbers.min;
+	}
+
+	public acceptEdits(range: LineRange, newLineCount: number): void {
+		this.lineCount = this.lineCount - range.length + newLineCount;
+		this._lineEndStates.replace(range.startLineNumber, range.length, newLineCount);
+		this._invalidEndStatesLineNumbers.resizeRange(range.startLineNumber, range.length, newLineCount);
+	}
+
+	public isTokenizationComplete(): boolean {
+		return this._invalidEndStatesLineNumbers.min === null;
 	}
 }
 
